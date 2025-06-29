@@ -1,15 +1,15 @@
-FROM node:20-alpine AS build
+FROM cgr.dev/chainguard/node:latest AS build
 
-RUN apk add --no-cache unzip
+#RUN apk add --no-cache unzip
 
-RUN mkdir /app
+#RUN mkdir /app
 WORKDIR /app
-COPY package.json .
-COPY yarn.lock .
-RUN yarn
-COPY src src
-COPY server server
-COPY bin bin
+COPY --chown=node:node package.json .
+COPY --chown=node:node package-lock.json .
+RUN npm ci 
+COPY --chown=node:node src src
+COPY --chown=node:node server server
+COPY --chown=node:node bin bin
 
 RUN chown -R node:node server/uploads
 USER node
