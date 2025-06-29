@@ -20,6 +20,7 @@
 		"multer": "^1.4.5-lts.1",
 		"opencc-js": "^1.0.5",
 		"pug": "^3.0.3",
+		"serverless-http": "^3.2.0",
 		"tempfile": "5.0.0",
 		"tmp-promise": "^3.0.3",
 		"xfetch-js": "^0.6.0"
