@@ -159,6 +159,9 @@ const PORT = process.env.PORT || 8763
 
 export const handler = serverless(app);
 
-const srv = app.listen(PORT, '0.0.0.0', () =>
-	console.log(`Server is listening at http://localhost:${PORT}`, srv.address())
-)
+// Allow local development: only start server if run directly
+if (require.main === module) {
+    app.listen(PORT, '0.0.0.0', () =>
+        console.log(`Server is listening at http://localhost:${PORT}`)
+    );
+}
