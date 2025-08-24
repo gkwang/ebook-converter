@@ -1,14 +1,14 @@
 {
 	"name": "ebook-converter",
 	"version": "1.0.0",
-	"main": "index.js",
 	"license": "MIT",
 	"bin": {
 		"opencc-cvt": "bin/cli.js",
 		"zhc-cvt": "bin/cli-zhc.js"
 	},
 	"scripts": {
-		"start": "node server/index.js"
+		"start": "node server/index.js",
+		"build": "echo 'No build step required'"
 	},
 	"dependencies": {
 		"archiver": "^7.0.1",
