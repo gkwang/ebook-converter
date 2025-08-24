@@ -13,15 +13,29 @@ This project has been migrated to use Netlify Blobs for file storage instead of 
 
 ### 3. Key Changes in `server/index.js`
 
+#### Dynamic Import Solution
+To avoid ES module compatibility issues in Netlify Functions, the `@netlify/blobs` package is loaded using dynamic imports instead of `require()`:
+- Uses `await import('@netlify/blobs')` instead of `require('@netlify/blobs')`
+- Initializes asynchronously during server startup
+- Gracefully falls back to local storage if import fails
+
 #### Storage Initialization
 ```javascript
-// Initialize Netlify Blobs store (only when in Netlify environment)
+// Initialize Netlify Blobs store using dynamic imports (to avoid ES module conflicts)
 let store
-try {
-	store = getStore('uploads')
-} catch (error) {
-	console.log('Not in Netlify environment, will use fallback local storage')
-	store = null
+let getStore
+
+const initializeStore = async () => {
+	try {
+		const { getStore: _getStore } = await import('@netlify/blobs')
+		getStore = _getStore
+		store = getStore('uploads')
+		console.log('Netlify Blobs store initialized')
+	} catch (error) {
+		console.log('Not in Netlify environment, will use fallback local storage')
+		store = null
+		getStore = null
+	}
 }
 ```
 
@@ -50,6 +64,18 @@ try {
 
 ## Deployment Notes
 
+### ES Module Compatibility
+This implementation uses dynamic imports to avoid the common error:
+```
+Error - require() of ES Module ... not supported
+```
+
+The solution:
+- Uses `await import('@netlify/blobs')` instead of `require('@netlify/blobs')`
+- Initializes the store asynchronously during server startup
+- Works correctly in both Netlify Functions and local development
+
+### Netlify Deployment
 When deploying to Netlify:
 - Netlify Blobs will be automatically available
 - No additional configuration required

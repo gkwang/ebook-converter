@@ -3,7 +3,6 @@ const path = require('path')
 const fs = require('fs-extra')
 const express = require('express')
 const multer = require('multer')
-const { getStore } = require('@netlify/blobs')
 const openccCvtEpub = require('../src/opencc-convert-epub')
 const openccCvtText = require('../src/opencc-convert-text')
 const zhcCvtEpub = require('../src/zhc-convert-epub')
@@ -17,25 +16,39 @@ app.use('/static', express.static(path.join(__dirname, 'static')))
 
 // Initialize Netlify Blobs store (only when in Netlify environment)
 let store
-try {
-	store = getStore('uploads')
-} catch (error) {
-	console.log('Not in Netlify environment, will use fallback local storage')
-	store = null
+let getStore
+
+const initializeStore = async () => {
+	try {
+		const { getStore: _getStore } = await import('@netlify/blobs')
+		getStore = _getStore
+		store = getStore('uploads')
+		console.log('Netlify Blobs store initialized')
+	} catch (error) {
+		console.log('Not in Netlify environment, will use fallback local storage')
+		store = null
+		getStore = null
+	}
 }
 
 // Fallback to local storage when not in Netlify environment
-const useLocalStorage = !store
-const uplDir = useLocalStorage ? path.join(__dirname, 'uploads') : null
+const useLocalStorage = () => !store
+const uplDir = path.join(__dirname, 'uploads')
 
-// Ensure uploads directory exists for local storage
-if (useLocalStorage) {
-	fs.ensureDirSync(uplDir)
+// Initialize store and ensure uploads directory exists
+const initialize = async () => {
+	await initializeStore()
+	if (useLocalStorage()) {
+		fs.ensureDirSync(uplDir)
+	}
 }
+
+// Call initialize function
+initialize().catch(console.error)
 
 // Utility functions for blob storage with local fallback
 const saveFileToBlob = async (buffer, key, metadata = {}) => {
-	if (useLocalStorage) {
+	if (useLocalStorage()) {
 		// Fallback to local storage
 		await fs.ensureDir(uplDir)
 		const filePath = path.join(uplDir, key)
@@ -48,7 +61,7 @@ const saveFileToBlob = async (buffer, key, metadata = {}) => {
 }
 
 const loadFileFromBlob = async (key, tempPath) => {
-	if (useLocalStorage) {
+	if (useLocalStorage()) {
 		// Copy from local storage
 		await fs.copyFile(key, tempPath)
 	} else {
@@ -70,7 +83,7 @@ const saveProcessedFileToBlob = async (tempPath, key) => {
 	const buffer = await fs.readFile(tempPath)
 	const stats = await fs.stat(tempPath)
 	
-	if (useLocalStorage) {
+	if (useLocalStorage()) {
 		const filePath = path.join(uplDir, key)
 		await fs.writeFile(filePath, buffer)
 		return filePath
@@ -87,13 +100,7 @@ const saveProcessedFileToBlob = async (tempPath, key) => {
 
 // Use memory storage for multer when using blobs, disk storage for local fallback
 const upload = multer({
-	storage: useLocalStorage ? multer.diskStorage({
-		destination: uplDir,
-		filename: (req, file, cb) => {
-			const fileId = Date.now().toString() + '-' + Math.random().toString(36).substr(2, 9)
-			cb(null, fileId)
-		}
-	}) : multer.memoryStorage(),
+	storage: multer.memoryStorage(), // Always use memory storage, we'll handle persistence in middleware
 	fileFilter: (req, file, cb) => {
 		// fix: https://github.com/expressjs/multer/pull/1102
 		file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf8')
@@ -122,7 +129,7 @@ const appendFileName = (originalName, text) => {
 }
 const downloadFile = async (res, fileName, storageKey) => {
 	try {
-		if (useLocalStorage) {
+		if (useLocalStorage()) {
 			// Use local file
 			const { size } = await fs.stat(storageKey)
 			res.setHeader('Content-Length', size)
@@ -162,7 +169,7 @@ async function performDelete(file) {
 	console.log(`Deleting ${file.id} ...`)
 	delete files[file.id]
 	
-	if (useLocalStorage) {
+	if (useLocalStorage()) {
 		// Delete local files
 		try {
 			await fs.unlink(file.storageKey)
@@ -231,22 +238,27 @@ const handleFileMiddleware = type => [
 	upload.single('file'),
 	async (req, res, next) => {
 		if (!req.file || req.file.mimetype !== type) {
-			if (useLocalStorage && req.file) {
-				fs.unlink(req.file.path, () => {})
-			}
 			return res.type('text').send(`檔案類型並非 ${type}`)
 		}
 		
-		let fileId, originalStorageKey, processedStorageKey
+		const fileId = Date.now().toString() + '-' + Math.random().toString(36).substr(2, 9)
+		let originalStorageKey, processedStorageKey
 		
-		if (useLocalStorage) {
-			// Use existing file path for local storage
-			fileId = req.file.filename
-			originalStorageKey = req.file.path
-			processedStorageKey = req.file.path // Will be overwritten after processing
+		if (useLocalStorage()) {
+			// Use local storage - save file to disk
+			const originalFileName = `original-${fileId}`
+			const processedFileName = `processed-${fileId}`
+			originalStorageKey = path.join(uplDir, originalFileName)
+			processedStorageKey = path.join(uplDir, processedFileName)
+			
+			try {
+				await fs.writeFile(originalStorageKey, req.file.buffer)
+			} catch (error) {
+				console.error('File save error:', error)
+				return res.status(500).send('檔案保存失敗')
+			}
 		} else {
 			// Use blob storage
-			fileId = Date.now().toString() + '-' + Math.random().toString(36).substr(2, 9)
 			originalStorageKey = `original-${fileId}`
 			processedStorageKey = `processed-${fileId}`
 			
@@ -290,7 +302,14 @@ const handleTaskCompletion = (file, task) =>
 			file.error = true
 			
 			// Clean up storage on error
-			if (!useLocalStorage && store) {
+			if (useLocalStorage()) {
+				try {
+					await fs.unlink(file.originalStorageKey)
+					console.log(`Cleaned up original local file ${file.originalStorageKey}`)
+				} catch (err) {
+					console.log(`Error cleaning up original local file: ${err}`)
+				}
+			} else {
 				try {
 					await store.delete(file.originalStorageKey)
 					console.log(`Cleaned up original blob ${file.originalStorageKey}`)
@@ -305,10 +324,9 @@ const handleTaskCompletion = (file, task) =>
 		})
 // Wrapper function to handle conversion with blob storage or local storage
 const processFileWithBlobs = async (file, conversionFunction, config) => {
-	if (useLocalStorage) {
+	if (useLocalStorage()) {
 		// For local storage, process in place
-		await conversionFunction(file.originalStorageKey, config)
-		file.storageKey = file.originalStorageKey
+		await conversionFunction(file.originalStorageKey, { ...config, dest: file.storageKey })
 	} else {
 		// For blob storage, use temporary files
 		const tempfile = require('tempfile')
