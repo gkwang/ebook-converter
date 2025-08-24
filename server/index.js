@@ -10,6 +10,7 @@ const zhcCvtText = require('../src/zhc-convert-text')
 
 const DELETE_DELAY = 5 * 60 * 1000 // 5 mins
 const app = express()
+app.engine('pug', require('pug').__express)
 app.set('view engine', 'pug')
 app.set('views', __dirname)
 app.use('/static', express.static(path.join(__dirname, 'static')))
