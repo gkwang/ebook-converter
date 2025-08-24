@@ -3,6 +3,7 @@ const path = require('path')
 const fs = require('fs-extra')
 const express = require('express')
 const multer = require('multer')
+const { getStore } = require('@netlify/blobs')
 const openccCvtEpub = require('../src/opencc-convert-epub')
 const openccCvtText = require('../src/opencc-convert-text')
 const zhcCvtEpub = require('../src/zhc-convert-epub')
@@ -13,9 +14,86 @@ const app = express()
 app.set('view engine', 'pug')
 app.set('views', __dirname)
 app.use('/static', express.static(path.join(__dirname, 'static')))
-const uplDir = path.join(__dirname, 'uploads')
+
+// Initialize Netlify Blobs store (only when in Netlify environment)
+let store
+try {
+	store = getStore('uploads')
+} catch (error) {
+	console.log('Not in Netlify environment, will use fallback local storage')
+	store = null
+}
+
+// Fallback to local storage when not in Netlify environment
+const useLocalStorage = !store
+const uplDir = useLocalStorage ? path.join(__dirname, 'uploads') : null
+
+// Ensure uploads directory exists for local storage
+if (useLocalStorage) {
+	fs.ensureDirSync(uplDir)
+}
+
+// Utility functions for blob storage with local fallback
+const saveFileToBlob = async (buffer, key, metadata = {}) => {
+	if (useLocalStorage) {
+		// Fallback to local storage
+		await fs.ensureDir(uplDir)
+		const filePath = path.join(uplDir, key)
+		await fs.writeFile(filePath, buffer)
+		return filePath
+	} else {
+		await store.set(key, buffer, { metadata })
+		return key
+	}
+}
+
+const loadFileFromBlob = async (key, tempPath) => {
+	if (useLocalStorage) {
+		// Copy from local storage
+		await fs.copyFile(key, tempPath)
+	} else {
+		const blob = await store.get(key, { type: 'stream' })
+		if (!blob) {
+			throw new Error('Blob not found')
+		}
+		
+		return new Promise((resolve, reject) => {
+			const writeStream = fs.createWriteStream(tempPath)
+			blob.pipe(writeStream)
+			writeStream.on('finish', resolve)
+			writeStream.on('error', reject)
+		})
+	}
+}
+
+const saveProcessedFileToBlob = async (tempPath, key) => {
+	const buffer = await fs.readFile(tempPath)
+	const stats = await fs.stat(tempPath)
+	
+	if (useLocalStorage) {
+		const filePath = path.join(uplDir, key)
+		await fs.writeFile(filePath, buffer)
+		return filePath
+	} else {
+		await store.set(key, buffer, { 
+			metadata: { 
+				size: stats.size,
+				processedAt: Date.now()
+			}
+		})
+		return key
+	}
+}
+
+// Use memory storage for multer when using blobs, disk storage for local fallback
 const upload = multer({
-	dest: uplDir,
+	storage: useLocalStorage ? multer.diskStorage({
+		destination: uplDir,
+		filename: (req, file, cb) => {
+			const fileId = Date.now().toString() + '-' + Math.random().toString(36).substr(2, 9)
+			cb(null, fileId)
+		}
+	}) : multer.memoryStorage(),
 	fileFilter: (req, file, cb) => {
 		// fix: https://github.com/expressjs/multer/pull/1102
 		file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf8')
@@ -42,22 +120,83 @@ const appendFileName = (originalName, text) => {
 	const name = parts.join('.')
 	return name + text + '.' + ext
 }
-const downloadFile = async (res, fileName, filePath) => {
-	const { size } = await fs.stat(filePath)
-	res.setHeader('Content-Length', size)
-	res.setHeader('X-File-Name', encodeURIComponent(fileName))
-	res.attachment(fileName).type('epub')
-	return new Promise((resolve, reject) =>
-		fs.createReadStream(filePath).pipe(res).on('finish', resolve).on('error', reject)
-	)
+const downloadFile = async (res, fileName, storageKey) => {
+	try {
+		if (useLocalStorage) {
+			// Use local file
+			const { size } = await fs.stat(storageKey)
+			res.setHeader('Content-Length', size)
+			res.setHeader('X-File-Name', encodeURIComponent(fileName))
+			res.attachment(fileName).type('epub')
+			return new Promise((resolve, reject) =>
+				fs.createReadStream(storageKey).pipe(res).on('finish', resolve).on('error', reject)
+			)
+		} else {
+			// Use blob storage
+			const blob = await store.get(storageKey, { type: 'stream' })
+			if (!blob) {
+				throw new Error('Blob not found')
+			}
+			
+			// Get metadata to set content length
+			const metadata = await store.getMetadata(storageKey)
+			if (metadata && metadata.size) {
+				res.setHeader('Content-Length', metadata.size)
+			}
+			
+			res.setHeader('X-File-Name', encodeURIComponent(fileName))
+			res.attachment(fileName).type('epub')
+			
+			return new Promise((resolve, reject) => {
+				blob.on('end', resolve)
+				blob.on('error', reject)
+				blob.pipe(res)
+			})
+		}
+	} catch (error) {
+		throw error
+	}
 }
 const files = Object.create(null)
-function performDelete(file) {
+async function performDelete(file) {
 	console.log(`Deleting ${file.id} ...`)
 	delete files[file.id]
-	fs.unlink(file.path).catch(err => {
-		console.log(`Deleting ${file.id} error: ${err}`)
-	})
+	
+	if (useLocalStorage) {
+		// Delete local files
+		try {
+			await fs.unlink(file.storageKey)
+			console.log(`Successfully deleted local file ${file.storageKey}`)
+		} catch (err) {
+			console.log(`Deleting local file ${file.id} error: ${err}`)
+		}
+		
+		if (file.originalStorageKey && file.originalStorageKey !== file.storageKey) {
+			try {
+				await fs.unlink(file.originalStorageKey)
+				console.log(`Successfully deleted original local file ${file.originalStorageKey}`)
+			} catch (err) {
+				console.log(`Deleting original local file ${file.id} error: ${err}`)
+			}
+		}
+	} else {
+		// Delete blobs
+		try {
+			await store.delete(file.storageKey)
+			console.log(`Successfully deleted processed blob ${file.storageKey}`)
+		} catch (err) {
+			console.log(`Deleting processed blob ${file.id} error: ${err}`)
+		}
+		
+		if (file.originalStorageKey) {
+			try {
+				await store.delete(file.originalStorageKey)
+				console.log(`Successfully deleted original blob ${file.originalStorageKey}`)
+			} catch (err) {
+				console.log(`Deleting original blob ${file.id} error: ${err}`)
+			}
+		}
+	}
 }
 function addDeleteTask(file) {
 	console.log(`Schedule ${file.id} for deletion...`)
@@ -65,7 +204,7 @@ function addDeleteTask(file) {
 		performDelete(file)
 	}, DELETE_DELAY)
 }
-app.get('/files/:id', (req, res) => {
+app.get('/files/:id', async (req, res) => {
 	const file = files[req.params.id]
 	if (!file) {
 		return res.status(404).send('找不到檔案')
@@ -73,7 +212,12 @@ app.get('/files/:id', (req, res) => {
 	if (!file.done) {
 		return res.status(404).send('檔案還沒準備完成')
 	}
-	downloadFile(res, appendFileName(file.originalName, '-converted'), file.path)
+	try {
+		await downloadFile(res, appendFileName(file.originalName, '-converted'), file.storageKey)
+	} catch (error) {
+		console.error('Download error:', error)
+		return res.status(404).send('檔案下載失敗')
+	}
 })
 app.get('/info/:id', (req, res) => {
 	res.set('Cache-control', 'no-cache, no-store, must-revalidate')
@@ -85,21 +229,50 @@ app.get('/info/:id', (req, res) => {
 })
 const handleFileMiddleware = type => [
 	upload.single('file'),
-	(req, res, next) => {
+	async (req, res, next) => {
 		if (!req.file || req.file.mimetype !== type) {
-			if (req.file) {
+			if (useLocalStorage && req.file) {
 				fs.unlink(req.file.path, () => {})
 			}
 			return res.type('text').send(`檔案類型並非 ${type}`)
 		}
-		const fileId = req.file.filename
+		
+		let fileId, originalStorageKey, processedStorageKey
+		
+		if (useLocalStorage) {
+			// Use existing file path for local storage
+			fileId = req.file.filename
+			originalStorageKey = req.file.path
+			processedStorageKey = req.file.path // Will be overwritten after processing
+		} else {
+			// Use blob storage
+			fileId = Date.now().toString() + '-' + Math.random().toString(36).substr(2, 9)
+			originalStorageKey = `original-${fileId}`
+			processedStorageKey = `processed-${fileId}`
+			
+			try {
+				// Save original file to blob storage
+				await saveFileToBlob(req.file.buffer, originalStorageKey, {
+					originalName: req.file.originalname,
+					mimetype: req.file.mimetype,
+					size: req.file.size,
+					uploadedAt: Date.now()
+				})
+			} catch (error) {
+				console.error('File upload error:', error)
+				return res.status(500).send('檔案上傳失敗')
+			}
+		}
+		
 		req.file = files[fileId] = {
 			originalName: req.file.originalname,
-			path: req.file.path,
+			originalStorageKey: originalStorageKey,
+			storageKey: processedStorageKey,
 			generated: Date.now(),
 			done: false,
 			id: fileId
 		}
+		
 		res.redirect(`/info/${fileId}`)
 		next()
 	}
@@ -112,16 +285,65 @@ const handleTaskCompletion = (file, task) =>
 			file.generated = Date.now()
 			addDeleteTask(file)
 		})
-		.catch(() => {
+		.catch(async () => {
 			console.log(`Conversion of ${file.id} failed`)
 			file.error = true
+			
+			// Clean up storage on error
+			if (!useLocalStorage && store) {
+				try {
+					await store.delete(file.originalStorageKey)
+					console.log(`Cleaned up original blob ${file.originalStorageKey}`)
+				} catch (err) {
+					console.log(`Error cleaning up original blob: ${err}`)
+				}
+			}
+			
 			setTimeout(() => {
 				performDelete(file)
 			}, 10 * 1000) // so that the user can see the error message (by redirecting to /info/:id)
 		})
+// Wrapper function to handle conversion with blob storage or local storage
+const processFileWithBlobs = async (file, conversionFunction, config) => {
+	if (useLocalStorage) {
+		// For local storage, process in place
+		await conversionFunction(file.originalStorageKey, config)
+		file.storageKey = file.originalStorageKey
+	} else {
+		// For blob storage, use temporary files
+		const tempfile = require('tempfile')
+		const inputTempPath = tempfile()
+		const outputTempPath = tempfile()
+		
+		try {
+			// Load original file from blob to temp file
+			await loadFileFromBlob(file.originalStorageKey, inputTempPath)
+			
+			// Perform conversion
+			await conversionFunction(inputTempPath, { ...config, dest: outputTempPath })
+			
+			// Save processed file back to blob storage
+			await saveProcessedFileToBlob(outputTempPath, file.storageKey)
+			
+			// Clean up temp files
+			await fs.unlink(inputTempPath).catch(() => {})
+			await fs.unlink(outputTempPath).catch(() => {})
+			
+			// Clean up original blob since we don't need it anymore
+			await store.delete(file.originalStorageKey).catch(() => {})
+			
+		} catch (error) {
+			// Clean up temp files on error
+			await fs.unlink(inputTempPath).catch(() => {})
+			await fs.unlink(outputTempPath).catch(() => {})
+			throw error
+		}
+	}
+}
+
 app.post('/opencc-convert-epub', handleFileMiddleware('application/epub+zip'), (req, res) => {
 	const { file } = req
-	const task = openccCvtEpub(file.path, {
+	const task = processFileWithBlobs(file, openccCvtEpub, {
 		type: {
 			from: req.body['type-from'],
 			to: req.body['type-to']
@@ -131,7 +353,7 @@ app.post('/opencc-convert-epub', handleFileMiddleware('application/epub+zip'), (
 })
 app.post('/opencc-convert-txt', handleFileMiddleware('text/plain'), (req, res) => {
 	const { file } = req
-	const task = openccCvtText(file.path, {
+	const task = processFileWithBlobs(file, openccCvtText, {
 		type: {
 			from: req.body['type-from'],
 			to: req.body['type-to']
@@ -141,14 +363,14 @@ app.post('/opencc-convert-txt', handleFileMiddleware('text/plain'), (req, res) =
 })
 app.post('/zhc-convert-epub', handleFileMiddleware('application/epub+zip'), (req, res) => {
 	const { file } = req
-	const task = zhcCvtEpub(file.path, {
+	const task = processFileWithBlobs(file, zhcCvtEpub, {
 		type: req.body.type
 	})
 	handleTaskCompletion(file, task)
 })
 app.post('/zhc-convert-txt', handleFileMiddleware('text/plain'), (req, res) => {
 	const { file } = req
-	const task = zhcCvtText(file.path, {
+	const task = processFileWithBlobs(file, zhcCvtText, {
 		type: req.body.type
 	})
 	handleTaskCompletion(file, task)
