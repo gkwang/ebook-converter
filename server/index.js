@@ -7,7 +7,6 @@ const openccCvtEpub = require('../src/opencc-convert-epub')
 const openccCvtText = require('../src/opencc-convert-text')
 const zhcCvtEpub = require('../src/zhc-convert-epub')
 const zhcCvtText = require('../src/zhc-convert-text')
-import serverless from "serverless-http";
 
 const DELETE_DELAY = 5 * 60 * 1000 // 5 mins
 const app = express()
@@ -157,11 +156,11 @@ app.post('/zhc-convert-txt', handleFileMiddleware('text/plain'), (req, res) => {
 
 const PORT = process.env.PORT || 8763
 
-export const handler = serverless(app);
-
 // Allow local development: only start server if run directly
 if (require.main === module) {
     app.listen(PORT, '0.0.0.0', () =>
         console.log(`Server is listening at http://localhost:${PORT}`)
     );
 }
+
+module.exports = app

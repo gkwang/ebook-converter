@@ -91,3 +91,4 @@ server/uploads/*
 !server/uploads/.gitkeep
 *.epub
 fly.toml
+.netlify

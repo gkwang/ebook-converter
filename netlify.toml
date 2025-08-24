@@ -1,0 +1,5 @@
+[build]
+  functions = "server"
+[dev]
+  framework = "#static"
+  publish = "static"
